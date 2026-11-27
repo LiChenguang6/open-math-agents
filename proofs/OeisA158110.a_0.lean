@@ -9,3 +9,4 @@ theorem OMA.solution : type_of% @OeisA158110.a_0 := by
   · simp [coeff_exp]
   · intro i hi
     rw [coeff_zero_eq_constantCoeff_apply, map_pow, h, zero_pow hi, smul_zero]
+-- infra smoke test (no change to the proof)
