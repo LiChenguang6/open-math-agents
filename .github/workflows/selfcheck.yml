@@ -1,0 +1,82 @@
+# Owner-side compile loop for one working copy of a submission.
+# Mirrors the upstream "check-proof" job (same tools/lint.py and tools/check.sh, same pinned
+# formal-conjectures commit), but runs on pushes to any branch of this fork, so the whole
+# Lean/Mathlib toolchain lives in the cloud and nothing heavy is downloaded locally.
+name: selfcheck
+on:
+  workflow_dispatch:
+    inputs:
+      file:
+        description: "path of the file to check, e.g. proofs/Erdos69.erdos_69.lean"
+        required: true
+  push:
+    paths: ["proofs/**", "reductions/**", "statements/**"]
+permissions:
+  contents: read
+concurrency:
+  group: selfcheck-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Which file
+        id: pick
+        run: |
+          set -euo pipefail
+          F="${{ github.event.inputs.file }}"
+          RE="^(proofs|reductions|statements)/[A-Za-z0-9_.'-]+[.]lean$"
+          if [ -z "$F" ]; then
+            F="$(git diff --name-only HEAD~1 HEAD | grep -E "$RE" | head -1 || true)"
+          fi
+          if [ -z "$F" ]; then
+            F="$( (git log --name-only --pretty=format: -n 5 | grep -E "$RE" | head -1) || true)"
+          fi
+          echo "checking: $F"
+          [ -n "$F" ] || { echo "no proof file to check on this push"; exit 1; }
+          echo "file=$F" >> "$GITHUB_OUTPUT"
+      - name: Pinned formal-conjectures
+        id: fc
+        run: |
+          set -euo pipefail
+          C=$(python3 -I -c 'import json;print(json.load(open("data/catalog.json"))["meta"]["upstreamCommit"])')
+          echo "commit=$C" >> "$GITHUB_OUTPUT"
+          git init -q "$RUNNER_TEMP/fc" && cd "$RUNNER_TEMP/fc"
+          git remote add origin https://github.com/google-deepmind/formal-conjectures
+          git fetch -q --depth 1 origin "$C" && git checkout -q FETCH_HEAD
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.elan
+            ${{ runner.temp }}/fc/.lake
+          key: selfcheck-fc-${{ steps.fc.outputs.commit }}
+      - name: Lean toolchain and Mathlib cache
+        run: |
+          set -euo pipefail
+          retry() { for i in 1 2 3 4; do "$@" && return 0; echo "attempt $i failed: $*"; sleep $((i * 20)); done; return 1; }
+          if ! command -v lake >/dev/null && [ ! -x ~/.elan/bin/lake ]; then
+            retry curl -sSfL --retry 3 https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -o /tmp/elan-init.sh
+            retry sh /tmp/elan-init.sh -y --default-toolchain none
+          fi
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.elan/bin:$PATH"
+          cd "$RUNNER_TEMP/fc" && retry lake exe cache get
+      - name: Compile and audit axioms
+        id: check
+        run: |
+          export PATH="$HOME/.elan/bin:$PATH"
+          OMA_FC="$RUNNER_TEMP/fc" tools/check.sh "${{ steps.pick.outputs.file }}" verdict.json || true
+          python3 -I -c 'import json;d=json.load(open("verdict.json"));print("VERDICT:",d["verdict"].upper());print("REASON:",d["reason"])'
+      - name: Show the Lean log
+        if: ${{ !cancelled() }}
+        run: |
+          python3 -I -c 'import json;d=json.load(open("verdict.json"));print("--- lean log ---");print(d.get("log") or "(empty)")' || true
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: verdict
+          path: verdict.json
